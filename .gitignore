@@ -1,0 +1,20 @@
+# Credentials — never commit
+.env
+
+# Runtime files
+*.log
+.notified
+.last_heartbeat
+.monitor.lock
+
+# Python
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
+
+# Editor / tooling
+.claude/
+.vscode/
+.idea/
