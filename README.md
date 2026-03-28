@@ -191,8 +191,14 @@ Regal publishes showtimes for your target date
               └── next cron run detects it
               └── email + desktop notification sent
               └── cron removes itself
-              └── .notified file written (blocks future duplicates)
+              └── .notified file written (stores movie + date, blocks duplicates)
               └── done — no further action needed
+
+If TARGET_DATE passes without the movie being found:
+              └── next cron run after the date detects expiry
+              └── "not found" summary email sent
+              └── cron removes itself
+              └── .notified written (prevents resend)
 ```
 
 ### Daily heartbeat email
@@ -252,6 +258,9 @@ Each run adds one line to `monitor.log`. Example over several days:
 
 ## Troubleshooting
 
+**".env file not found"**
+The `.env` file must exist in the project root. Create it with the five required variables listed in the setup section.
+
 **"Missing required .env variable(s)"**
 All five variables in `.env` must have values. Check for typos or blank lines.
 
@@ -279,6 +288,23 @@ The notification already fired. To resend manually:
 rm .notified && ./run_now.sh --run
 ```
 
+**"TARGET_DATE has already passed and the monitor has never run"**
+You set a past date in `.env` before the monitor ever ran. Update `TARGET_DATE` to a future date.
+
+**"not found" summary email received**
+The target date passed without the movie being listed. To watch for a new movie or date:
+```bash
+# Update MOVIE_TITLE and TARGET_DATE in .env, then:
+rm -f .notified .last_heartbeat
+./run_now.sh --cron-on
+```
+
+**".notified exists for different movie/date" warning in log**
+`.env` was changed after a previous notification. Delete `.notified` to start fresh:
+```bash
+rm .notified && ./run_now.sh --cron-on
+```
+
 ---
 
 ## Architecture Notes
@@ -289,4 +315,6 @@ rm .notified && ./run_now.sh --run
 
 **Process safety:** `fcntl.flock(LOCK_EX | LOCK_NB)` on a shared lock file prevents concurrent runs from cron and manual triggers interfering with each other.
 
-**Duplicate prevention:** A `.notified` sentinel file is written after successful delivery and checked at startup. If present, the script exits in under a second — no browser launched.
+**Duplicate prevention:** A `.notified` sentinel file is written after successful delivery and checked at startup. If present, the script exits in under a second — no browser launched. The sentinel stores `movie=`, `date=`, and `notified_at=` so the script can detect when `.env` has been changed to a new movie/date and warn you rather than silently exiting.
+
+**Past-date handling:** If `TARGET_DATE` has already passed when the script runs, the outcome depends on history. If neither `.notified` nor `.last_heartbeat` exists (monitor never ran), it exits with an error so you know to fix the config. If either file exists (monitor ran but movie was never found), it sends a one-time "not found" summary email and removes the cron job.

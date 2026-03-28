@@ -92,6 +92,11 @@ def load_config(logger: logging.Logger) -> tuple[str, str, str, str, date] | Non
     Read and validate required settings from .env.
     Returns (sender, password, recipient, movie_keyword, target_date) or None.
     """
+    env_file = SCRIPT_DIR / ".env"
+    if not env_file.exists():
+        logger.error(".env file not found — create it with the required variables.")
+        return None
+
     sender    = os.environ.get("SENDER_EMAIL", "").strip()
     password  = os.environ.get("SENDER_APP_PASSWORD", "").strip()
     recipient = os.environ.get("RECIPIENT_EMAIL", "").strip()
@@ -220,6 +225,7 @@ def fetch_showtimes(target_date: date, logger: logging.Logger) -> dict | None:
     data = _fetch_direct(target_date, logger)
     if data is not None:
         return data
+    logger.debug("Direct API unavailable — using browser fallback.")
     return _fetch_via_browser(target_date, logger)
 
 
@@ -551,10 +557,27 @@ def notification_already_sent() -> bool:
     return SENTINEL_FILE.exists()
 
 
-def mark_as_notified() -> None:
+def mark_as_notified(movie_keyword: str, target_date: date) -> None:
     SENTINEL_FILE.write_text(
-        f"Notification sent at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"movie={movie_keyword}\n"
+        f"date={target_date.isoformat()}\n"
+        f"notified_at={datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
     )
+
+
+def read_sentinel_config() -> tuple[str, date] | None:
+    """Return (movie_keyword, target_date) stored in sentinel, or None."""
+    if not SENTINEL_FILE.exists():
+        return None
+    try:
+        data = dict(
+            line.split("=", 1)
+            for line in SENTINEL_FILE.read_text().splitlines()
+            if "=" in line
+        )
+        return data["movie"], date.fromisoformat(data["date"])
+    except (KeyError, ValueError, OSError):
+        return None
 
 
 # ── Post-notification actions ──────────────────────────────────────────────────
@@ -590,6 +613,54 @@ def remove_cron_job(logger: logging.Logger) -> None:
         )
 
 
+# ── Not-found summary email ────────────────────────────────────────────────────
+
+def _send_not_found_email(
+    movie_keyword: str,
+    target_date: date,
+    sender: str,
+    password: str,
+    recipient: str,
+    logger: logging.Logger,
+) -> None:
+    """
+    Sent when TARGET_DATE has passed and the movie was never listed.
+    Writes the sentinel so the email isn't resent on subsequent runs.
+    """
+    subject = f"Monitor complete — {movie_keyword!r} not found by {target_date}"
+    body = "\n".join([
+        f"The monitor has finished watching for {movie_keyword!r}.",
+        "",
+        f"Theater   : {THEATER_NAME}",
+        f"Target    : {target_date.strftime('%A, %B %d, %Y')}",
+        "",
+        "The movie was never listed on the Regal schedule for that date.",
+        "To watch for a new movie or date, update .env and run:",
+        "  rm -f .notified .last_heartbeat",
+        "  ./run_now.sh --cron-on",
+        "",
+        "— Movie Monitor (automated)",
+    ])
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"]    = sender
+    msg["To"]      = recipient
+    msg.attach(MIMEText(body, "plain", "utf-8"))
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as smtp:
+            smtp.login(sender, password)
+            smtp.sendmail(sender, recipient, msg.as_string())
+        SENTINEL_FILE.write_text(
+            f"movie={movie_keyword}\n"
+            f"date={target_date.isoformat()}\n"
+            f"not_found=true\n"
+            f"notified_at={datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        )
+        logger.info("'Not found' summary email sent to %s", recipient)
+    except Exception as exc:
+        logger.warning("Could not send 'not found' email: %s", exc)
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 MAX_FETCH_ATTEMPTS = 3
@@ -609,16 +680,44 @@ def main() -> None:
             sys.exit(1)
         sender, password, recipient, movie_keyword, target_date = config
 
-        # Guard: date has passed — clean up and stop
+        # Guard: date has passed
         today = date.today()
         if today > target_date:
-            logger.info("Target date %s has passed — monitoring complete.", target_date)
-            remove_cron_job(logger)
-            sys.exit(0)
+            is_first_run = not SENTINEL_FILE.exists() and not HEARTBEAT_FILE.exists()
+            if is_first_run:
+                # Scenario A: user configured a past date before the monitor ever ran
+                logger.error(
+                    "TARGET_DATE %s has already passed and the monitor has never run "
+                    "for this config. Update TARGET_DATE in .env to a future date.",
+                    target_date,
+                )
+                sys.exit(1)
+            else:
+                # Scenario B: monitor ran for days; date expired without finding movie
+                logger.info(
+                    "Target date %s has passed — %r was never listed. "
+                    "Sending 'not found' summary and stopping.",
+                    target_date, movie_keyword,
+                )
+                if not notification_already_sent():
+                    _send_not_found_email(
+                        movie_keyword, target_date,
+                        sender, password, recipient, logger,
+                    )
+                remove_cron_job(logger)
+                sys.exit(0)
 
         # Guard: already notified
         if notification_already_sent():
-            logger.info("Already notified — nothing to do.")
+            sentinel = read_sentinel_config()
+            if sentinel and sentinel != (movie_keyword, target_date):
+                logger.warning(
+                    ".notified exists for %r / %s but .env now has %r / %s. "
+                    "Delete .notified to start fresh.",
+                    sentinel[0], sentinel[1], movie_keyword, target_date,
+                )
+            else:
+                logger.info("Already notified — nothing to do.")
             sys.exit(0)
 
         # Fetch with retries
@@ -660,7 +759,7 @@ def main() -> None:
         success = send_email(subject, plain_text, html_body, sender, password, recipient, logger)
 
         if success:
-            mark_as_notified()
+            mark_as_notified(movie_keyword, target_date)
             notify_desktop(film["Title"], logger)
             remove_cron_job(logger)
             logger.info("Done — email sent, desktop notified, cron removed.")
