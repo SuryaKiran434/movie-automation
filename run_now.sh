@@ -18,7 +18,7 @@ MONITOR="$SCRIPT_DIR/monitor.py"
 LOG="$SCRIPT_DIR/monitor.log"
 
 # Cron entry that will be installed / removed
-CRON_ENTRY="*/30 * * * * $PYTHON $MONITOR >> $LOG 2>&1"
+CRON_ENTRY="*/30 * * * * $PYTHON $MONITOR >> $LOG 2>/dev/null"
 CRON_MARKER="monitor.py"   # used to find our entry among all cron jobs
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
