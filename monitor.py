@@ -48,6 +48,11 @@ SCRIPT_DIR     = Path(__file__).parent.resolve()
 LOG_FILE       = SCRIPT_DIR / "monitor.log"
 SENTINEL_FILE  = SCRIPT_DIR / ".notified"
 HEARTBEAT_FILE = SCRIPT_DIR / ".last_heartbeat"
+# Chromium user-data dir for the browser fallback. Persisting it keeps the
+# Cloudflare clearance cookie between runs so the fallback skips the challenge
+# instead of solving a fresh one every time. Holds only regmovies.com browsing
+# state — no logins happen in this flow, so no credentials land here. Gitignored.
+BROWSER_PROFILE_DIR = SCRIPT_DIR / ".browser-profile"
 
 load_dotenv(SCRIPT_DIR / ".env")
 
@@ -172,9 +177,45 @@ def _fetch_direct(target_date: date, logger: logging.Logger) -> dict | None:
 
 # ── API fetch: slow path (headless browser) ───────────────────────────────────
 
+BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/122.0.0.0 Safari/537.36"
+)
+
+
+def _open_browser_context(playwright, logger: logging.Logger):
+    """
+    Open a headless Chromium context backed by a persistent profile directory.
+
+    The profile keeps cookies (notably Cloudflare's cf_clearance) across runs,
+    so repeat fallbacks reuse an existing clearance instead of paying for a
+    fresh challenge. Only one monitor runs at a time (see ProcessLock), so the
+    profile is never contended; if the directory is nevertheless unusable —
+    stale Chromium lock, bad permissions — fall back to a throwaway context so
+    the monitor still works rather than failing outright.
+    """
+    try:
+        BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+        return playwright.chromium.launch_persistent_context(
+            user_data_dir=str(BROWSER_PROFILE_DIR),
+            headless=True,
+            user_agent=BROWSER_UA,
+            locale="en-US",
+        )
+    except Exception as exc:
+        logger.warning(
+            "Persistent browser profile at %s unusable (%s) — using a throwaway "
+            "profile for this run.", BROWSER_PROFILE_DIR, exc,
+        )
+        browser = playwright.chromium.launch(headless=True)
+        return browser.new_context(user_agent=BROWSER_UA, locale="en-US")
+
+
 def _fetch_via_browser(target_date: date, logger: logging.Logger) -> dict | None:
     """
-    Launch headless Chromium to bypass Cloudflare.
+    Launch headless Chromium to bypass Cloudflare, reusing a persistent
+    profile so a previously earned Cloudflare clearance is not thrown away.
 
     Navigates directly to the theater URL with the target date as a query
     parameter (?date=MM-DD-YYYY). The Regal React app reads that parameter
@@ -186,15 +227,8 @@ def _fetch_via_browser(target_date: date, logger: logging.Logger) -> dict | None
     url = f"{THEATER_URL}?date={target_date.strftime('%m-%d-%Y')}"
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.0.0 Safari/537.36"
-            ),
-            locale="en-US",
-        ).new_page()
+        context = _open_browser_context(p, logger)
+        page = context.pages[0] if context.pages else context.new_page()
 
         try:
             with page.expect_response(
@@ -211,7 +245,7 @@ def _fetch_via_browser(target_date: date, logger: logging.Logger) -> dict | None
             logger.error("Browser fetch failed: %s", exc)
             data = None
         finally:
-            browser.close()
+            context.close()
 
     return data
 

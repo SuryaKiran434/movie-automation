@@ -7,6 +7,9 @@
 .last_heartbeat
 .monitor.lock
 
+# Chromium profile for the browser fallback (cookies/cache only, no credentials)
+.browser-profile/
+
 # Python
 __pycache__/
 *.py[cod]
