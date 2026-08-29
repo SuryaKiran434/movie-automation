@@ -20,6 +20,8 @@ Every 30 minutes (cron)
                  ▼
   ┌─────────────────────────────────┐
   │  2. Launch headless Chromium    │  ← passes Cloudflare bot detection
+  │     on a PERSISTENT profile     │    .browser-profile/ keeps cf_clearance
+  │     (.browser-profile/)         │    so repeat fallbacks skip the challenge
   │     Navigate to theater page    │    triggers getShowtimes API client-side
   │     with ?date=MM-DD-YYYY       │    by including the date in the URL
   └──────────────┬──────────────────┘
@@ -46,6 +48,8 @@ Every 30 minutes (cron)
 - A sentinel file (`.notified`) prevents duplicate emails even if cron is accidentally re-added
 - A daily heartbeat email confirms the monitor is alive and shows what IS currently scheduled
 - After a successful notification the cron job removes itself automatically
+- The browser fallback reuses a persistent Chromium profile, so a Cloudflare clearance earned on one run is not thrown away on the next. **This speeds up the fallback only — it does not change how often the fast path succeeds.** See [Architecture Notes](#architecture-notes).
+- Fetching is retried up to 3 times per run with a 5-second delay between attempts
 
 ---
 
@@ -56,8 +60,11 @@ regal-showtime-monitor/
 ├── monitor.py        Main monitoring script (called by cron)
 ├── lock.py           Process lock — prevents concurrent runs
 ├── run_now.sh        Control panel: run on demand, manage cron
+├── tests/            pytest suite (fully mocked — no network, no browser)
 ├── requirements.txt  Python dependencies
+├── .env.example      Template for .env — placeholders only, safe to commit
 ├── .env              Your credentials and config (gitignored, never committed)
+├── .github/          CI workflow and Dependabot config
 └── .gitignore
 ```
 
@@ -67,15 +74,25 @@ monitor.log           Audit log
 .notified             Sentinel — written after email is sent
 .last_heartbeat       Tracks when last daily heartbeat was sent
 .monitor.lock         Process lock file
+.browser-profile/     Chromium user-data dir for the fallback (cookies/cache)
 ```
+
+`.browser-profile/` holds only regmovies.com browsing state. No login happens
+anywhere in this flow, so no credentials land there — but it is gitignored
+regardless, and a test asserts that it stays that way.
 
 ---
 
 ## Prerequisites
 
 - macOS (uses `osascript` for desktop notifications and `crontab` for scheduling)
-- Python 3.11+ — via [pyenv](https://github.com/pyenv/pyenv) or system install
+- **Python 3.12+** — via [pyenv](https://github.com/pyenv/pyenv) or a system install. CI runs 3.12.
 - A Gmail account with 2-Step Verification enabled
+
+> **Heads-up:** `run_now.sh` invokes a hard-coded interpreter path
+> (`/Users/suryakiran/.pyenv/versions/3.13.1/bin/python3`), and that same path is
+> baked into the cron entry it installs. On any other machine, edit the `PYTHON`
+> variable at the top of `run_now.sh` before installing cron.
 
 ---
 
@@ -91,13 +108,25 @@ cd regal-showtime-monitor
 ### 2. Install Python dependencies
 
 ```bash
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
-python3 -m playwright install chromium
+
+# Chromium binary (~400MB) for the browser fallback.
+# Needed for real runs. NOT needed to run the tests — see "Running the tests".
+playwright install chromium
 ```
 
 ### 3. Create your `.env` file
 
-Create a file named `.env` in the project root with the following contents:
+Copy the template and fill in your own values:
+
+```bash
+cp .env.example .env
+```
+
+[`.env.example`](.env.example) carries placeholders only and is safe to commit.
+`.env` is gitignored and must never be:
 
 ```
 SENDER_EMAIL=you@gmail.com
@@ -107,6 +136,9 @@ MOVIE_TITLE=dhurandhar
 TARGET_DATE=03-27-2026
 TEST_RECIPIENT_EMAIL=
 ```
+
+All five of the first variables are required; `monitor.py` refuses to start and
+names the missing ones if any is blank.
 
 | Variable | Description |
 |---|---|
@@ -158,6 +190,17 @@ All operations go through `run_now.sh`. Run it with no arguments for an interact
 ./run_now.sh --cron-status # Check whether cron is active
 ```
 
+`--cron-on` rewrites your user crontab: it strips any existing line containing
+`monitor.py` (so re-running never duplicates the job), then appends
+
+```
+*/30 * * * * $PYTHON /path/to/monitor.py >> /path/to/monitor.log 2>/dev/null
+```
+
+`--cron-off` removes it again by the same `monitor.py` marker. No `sudo`, no
+LaunchAgent — this is a plain user crontab entry you can inspect with
+`crontab -l`.
+
 ### Typical workflow
 
 ```bash
@@ -177,6 +220,36 @@ When the movie is found:
 1. Email alert delivered to `RECIPIENT_EMAIL`
 2. macOS desktop notification pops up immediately
 3. Cron job removed automatically — no manual cleanup needed
+
+---
+
+## Running the tests
+
+```bash
+pip install pytest
+python -m pytest
+```
+
+**13 tests**, all of them fully mocked. They run against an in-file
+`getShowtimes` fixture — the exact payload shape Regal returns — so nothing
+touches the network, and the browser path is stubbed rather than driven.
+
+That means **`playwright install chromium` is not required to run the tests.**
+CI installs the `playwright` package (it is imported at module scope in
+`monitor.py`) but deliberately skips the ~400MB browser download.
+
+Coverage:
+
+| Area | Tests |
+|---|---|
+| `find_movie` | case-insensitive substring match, absent title, empty payload |
+| Parsing | `_film_titles`, `_parse_language`, `_format_time`, `_experience_label` |
+| Email | `build_email` renders grouped, sorted showtimes |
+| Fetch strategy | direct path preferred; browser fallback used when direct returns `None` |
+| Browser profile | profile dir location and name, persistent context is used, graceful fallback when the profile dir is unusable, and that the dir is gitignored |
+
+CI runs on every push to `main` and every pull request. The **`Tests (Python)`**
+check is a required status check on `main`.
 
 ---
 
@@ -299,6 +372,14 @@ rm -f .notified .last_heartbeat
 ./run_now.sh --cron-on
 ```
 
+**"Persistent browser profile ... unusable — using a throwaway profile"**
+The monitor still ran; only the Cloudflare-clearance reuse was lost for that
+run. Usually a stale Chromium lock left behind by a killed process. Delete the
+profile and let it rebuild:
+```bash
+rm -rf .browser-profile && ./run_now.sh --run
+```
+
 **".notified exists for different movie/date" warning in log**
 `.env` was changed after a previous notification. Delete `.notified` to start fresh:
 ```bash
@@ -309,7 +390,13 @@ rm .notified && ./run_now.sh --cron-on
 
 ## Architecture Notes
 
-**Cloudflare bypass:** Direct HTTPS calls to the Regal API return 403. Playwright launches a real Chromium browser which passes Cloudflare's bot detection. The browser navigates to `THEATER_URL?date=MM-DD-YYYY`, the Regal React app reads the date parameter and calls the `getShowtimes` API client-side, and Playwright intercepts that response via `page.expect_response()`.
+**Two-path fetch strategy:** `fetch_showtimes()` tries `_fetch_direct()` first — a plain `httpx` HTTP/2 GET straight at `getShowtimes` with browser-ish headers, ~1s when it works. If it returns anything other than a 200, or raises, the function falls through to `_fetch_via_browser()`. There is no shared state between the two; the fast path is simply attempted first every run.
+
+**Cloudflare bypass:** Direct HTTPS calls to the Regal API frequently return 403. Playwright launches a real Chromium browser which passes Cloudflare's bot detection. The browser navigates to `THEATER_URL?date=MM-DD-YYYY`, the Regal React app reads the date parameter and calls the `getShowtimes` API client-side, and Playwright intercepts that response via `page.expect_response()`.
+
+**Persistent browser profile:** `_open_browser_context()` uses `launch_persistent_context()` against a gitignored `.browser-profile/` directory rather than a fresh throwaway context. Chromium keeps its cookies there, including Cloudflare's `cf_clearance`, so a clearance earned on one fallback is still valid on the next one and the challenge is skipped instead of re-solved. Only one monitor runs at a time (see the process lock), so the profile is never contended. If the directory turns out to be unusable — a stale Chromium lock, wrong permissions — the code logs a warning and falls back to a throwaway `launch()` + `new_context()` for that run, so an unusable profile degrades performance rather than breaking the monitor.
+
+> **What the profile does *not* do:** it does not improve the fast path's hit rate. `_fetch_direct()` builds its own `httpx.Client`, which has a **separate cookie jar** and never sees the browser profile. A `cf_clearance` cookie sitting in `.browser-profile/` is invisible to it. The persistent profile makes the **browser fallback** cheaper; the direct HTTPS call succeeds or fails exactly as often as it did before.
 
 **Event-driven response capture:** `page.expect_response()` wraps the `page.goto()` call — the script receives the data the instant the API responds, rather than sleeping for a fixed duration.
 
