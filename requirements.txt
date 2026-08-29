@@ -1,3 +1,10 @@
-playwright>=1.62.0
-python-dotenv>=1.2.3
-httpx[http2]>=0.28.1
+# Pinned to the exact versions CI already resolved (run 33281144998, the last
+# green run on main), so this locks the set rather than moving it. Ranges
+# (`>=`) meant every run was free to pull a different resolution than the one
+# that was last verified.
+#
+# Bump intentionally -- via Dependabot or a deliberate edit -- not implicitly.
+
+playwright==1.62.0
+python-dotenv==1.2.3
+httpx[http2]==0.28.1
