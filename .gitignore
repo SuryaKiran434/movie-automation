@@ -13,6 +13,12 @@
 # Python
 __pycache__/
 *.py[cod]
+.pytest_cache/
+
+# Virtualenvs. run_now.sh resolves ./venv or ./.venv as its interpreter when
+# nothing else is activated, so these are expected to exist locally.
+venv/
+.venv/
 
 # macOS
 .DS_Store

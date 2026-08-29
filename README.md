@@ -57,9 +57,9 @@ Every 30 minutes (cron)
 
 ```
 regal-showtime-monitor/
-├── monitor.py        Main monitoring script (called by cron)
+├── monitor.py        Main monitoring script (run via run_now.sh from cron)
 ├── lock.py           Process lock — prevents concurrent runs
-├── run_now.sh        Control panel: run on demand, manage cron
+├── run_now.sh        Control panel: resolves Python, runs on demand, manages cron
 ├── tests/            pytest suite (fully mocked — no network, no browser)
 ├── requirements.txt  Python dependencies
 ├── .env.example      Template for .env — placeholders only, safe to commit
@@ -89,10 +89,29 @@ regardless, and a test asserts that it stays that way.
 - **Python 3.12+** — via [pyenv](https://github.com/pyenv/pyenv) or a system install. CI runs 3.12.
 - A Gmail account with 2-Step Verification enabled
 
-> **Heads-up:** `run_now.sh` invokes a hard-coded interpreter path
-> (`/Users/suryakiran/.pyenv/versions/3.13.1/bin/python3`), and that same path is
-> baked into the cron entry it installs. On any other machine, edit the `PYTHON`
-> variable at the top of `run_now.sh` before installing cron.
+`run_now.sh` resolves the Python interpreter **at run time** — nothing is
+hard-coded, so it works on a fresh clone and survives a Python upgrade. It picks
+the first of:
+
+1. `$MOVIE_MONITOR_PYTHON`, if you set it — an explicit override that wins over
+   everything else
+2. `$VIRTUAL_ENV/bin/python` — the venv you have activated
+3. `./venv/bin/python` or `./.venv/bin/python` next to the script — the venv the
+   setup below creates
+4. `python3` from `$PATH`
+
+If none of those turns up a usable interpreter it exits non-zero and prints
+what it looked at and how to fix it, rather than failing silently. Check what
+it would use:
+
+```bash
+./run_now.sh --print-python
+```
+
+> **Under cron**, `$PATH` is minimal (usually `/usr/bin:/bin`) and your shell
+> profile is not sourced, so a pyenv shim will not be found. Options 3 and 4 are
+> what cron relies on — the repo-local `./venv` (absolute, PATH-independent) is
+> the most reliable, or set `MOVIE_MONITOR_PYTHON` in the crontab itself.
 
 ---
 
@@ -190,16 +209,31 @@ All operations go through `run_now.sh`. Run it with no arguments for an interact
 ./run_now.sh --cron-status # Check whether cron is active
 ```
 
-`--cron-on` rewrites your user crontab: it strips any existing line containing
-`monitor.py` (so re-running never duplicates the job), then appends
+Diagnostics:
+
+```bash
+./run_now.sh --print-python      # Show which interpreter would be used
+./run_now.sh --print-cron-entry  # Show the crontab line --cron-on would install
+./run_now.sh --cron-run          # What the cron entry itself invokes
+```
+
+`--cron-on` rewrites your user crontab: it strips any existing line for this
+job (so re-running never duplicates it), then appends
 
 ```
-*/30 * * * * $PYTHON /path/to/monitor.py >> /path/to/monitor.log 2>/dev/null
+*/30 * * * * "/path/to/run_now.sh" --cron-run >> "/path/to/monitor.log" 2>&1 # movie-monitor
 ```
 
-`--cron-off` removes it again by the same `monitor.py` marker. No `sudo`, no
-LaunchAgent — this is a plain user crontab entry you can inspect with
-`crontab -l`.
+The entry calls **`run_now.sh`, not an interpreter path** — so the interpreter is
+resolved every time the job fires and the entry does not go stale when Python
+moves. stderr goes to the log rather than `/dev/null`, so a resolution failure
+shows up in `--status` instead of vanishing.
+
+`--cron-off` removes it again, matching either the `# movie-monitor` marker or
+the older `monitor.py` form, so an entry installed by a previous version of this
+script is cleaned up (and `--cron-on` migrates it in place). Unrelated crontab
+lines are left alone. No `sudo`, no LaunchAgent — a plain user crontab entry you
+can inspect with `crontab -l`.
 
 ### Typical workflow
 
@@ -230,9 +264,11 @@ pip install pytest
 python -m pytest
 ```
 
-**13 tests**, all of them fully mocked. They run against an in-file
+**22 tests**, all of them fully mocked. The parsing tests run against an in-file
 `getShowtimes` fixture — the exact payload shape Regal returns — so nothing
-touches the network, and the browser path is stubbed rather than driven.
+touches the network, and the browser path is stubbed rather than driven. The
+`run_now.sh` tests shell out to the script with controlled environments and
+stub interpreters; they never read or write the real crontab.
 
 That means **`playwright install chromium` is not required to run the tests.**
 CI installs the `playwright` package (it is imported at module scope in
@@ -247,6 +283,7 @@ Coverage:
 | Email | `build_email` renders grouped, sorted showtimes |
 | Fetch strategy | direct path preferred; browser fallback used when direct returns `None` |
 | Browser profile | profile dir location and name, persistent context is used, graceful fallback when the profile dir is unusable, and that the dir is gitignored |
+| Interpreter resolution | all four branches in priority order (`$MOVIE_MONITOR_PYTHON`, activated venv, repo-local `venv`/`.venv`, `python3` on PATH), loud non-zero failure for an unusable override and for no interpreter at all, and that the cron entry embeds no interpreter path |
 
 CI runs on every push to `main` and every pull request. The **`Tests (Python)`**
 check is a required status check on `main`.
