@@ -13,6 +13,11 @@
 # Python
 __pycache__/
 *.py[cod]
+
+# Coverage
+coverage.xml
+.coverage
+htmlcov/
 .pytest_cache/
 
 # Virtualenvs. run_now.sh resolves ./venv or ./.venv as its interpreter when
