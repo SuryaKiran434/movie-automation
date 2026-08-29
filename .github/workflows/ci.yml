@@ -28,12 +28,24 @@ jobs:
       # `playwright` the package is installed, but `playwright install`
       # (browser binaries, ~400MB) is deliberately skipped: every test runs
       # against an in-file getShowtimes fixture and stubs the browser path.
+      #
+      # `--only-binary :all:` makes pip refuse source distributions, so no
+      # package's setup.py executes on the runner. Verified against the
+      # runner's target (cp312/manylinux): the resolved tree is 21
+      # distributions and every one of them has a wheel, playwright and
+      # greenlet included, so this constrains what pip may do without changing
+      # what it installs.
+      #
+      # `python -m pip install --upgrade pip` used to lead this block. The run
+      # log shows it doing nothing -- setup-python already provides the current
+      # pip -- and pinning it would turn it into a downgrade the day the runner
+      # image moves ahead, so the line is gone instead.
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          # Test-only; requirements.txt stays the pinned runtime set.
-          pip install pytest pytest-cov
+          pip install -r requirements.txt --only-binary :all:
+          # Test-only; requirements.txt stays the runtime set. Pinned to the
+          # versions CI already resolved, so behaviour is unchanged.
+          pip install pytest==9.1.1 pytest-cov==7.1.0 --only-binary :all:
 
       # monitor.py and lock.py are the two source modules at the repo root;
       # everything else here is shell scripts, logs and tests.
